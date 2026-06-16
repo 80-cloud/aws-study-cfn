@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: aws-study CloudFormation full stack (VPC/Subnet/IGW/Route/SG/EC2/RDS)
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: latest Amazon Linux 2023 AMI
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: RDS master password (8+ chars)
+  KeyName:
+    Type: String
+    Default: ""
+    Description: EC2 キーペア名（空ならSSHキーなしで作成。SSHが必要な環境でのみ指定）
+
+Conditions:
+  # KeyName が空でないときだけ EC2 に鍵を付ける（指定キーペアが無い環境でも失敗しないように）
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  StudyVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-vpc
+
+  StudyIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-igw
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref StudyVpc
+      InternetGatewayId: !Ref StudyIgw
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-public-a
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-public-c
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-private-a
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVpc
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-private-c
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref StudyVpc
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref StudyIgw
+
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: aws-study EC2 SG (app 8080 from ALB only, no SSH)
+      VpcId: !Ref StudyVpc
+      SecurityGroupIngress:
+        # SSH(22)は開けない。8080はALB SGからのみ許可（インターネットへ直接は晒さない）
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-ec2-sg
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: aws-study RDS SG (3306 from EC2 SG)
+      VpcId: !Ref StudyVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-rds-sg
+
+  StudyEc2:
+    Type: AWS::EC2::Instance
+    # RDS endpoint を UserData で参照(!GetAtt)しているので、CFN が自動で「RDSの後にEC2」と順序付けする
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+      # 起動時に Java導入→clone→DDL投入→接続先をRDSに→build→常駐起動まで自動実行
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -xe
+            dnf install -y java-21-amazon-corretto-devel git mariadb105
+            dd if=/dev/zero of=/swapfile bs=1M count=2048
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            cd /opt
+            git clone https://github.com/koujienami/aws-study.git
+            cd /opt/aws-study
+            mysql -h ${StudyRds.Endpoint.Address} -u root -p${DBPassword} awsstudy < src/main/resources/create.sql
+            sed -i "s#localhost:3306#${StudyRds.Endpoint.Address}:3306#" src/main/resources/application.properties
+            sed -i "s#=rootroot#=${DBPassword}#" src/main/resources/application.properties
+            chmod +x gradlew
+            ./gradlew build -x test
+            cat > /etc/systemd/system/awsstudy.service <<'UNIT'
+            [Unit]
+            Description=aws-study
+            After=network.target
+            [Service]
+            ExecStart=/usr/bin/java -jar /opt/aws-study/build/libs/demo-0.0.1-SNAPSHOT.war
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now awsstudy
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-ec2
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: aws-study RDS subnet group (2 AZ)
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetC
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-db-subnet-group
+
+  StudyRds:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: aws-study-cfn-rds
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      MasterUsername: root
+      MasterUserPassword: !Ref DBPassword
+      DBName: awsstudy
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 0
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-rds
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: aws-study ALB SG (HTTP 80)
+      VpcId: !Ref StudyVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-alb-sg
+
+  StudyAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: aws-study-cfn-alb
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetC
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-alb
+
+  StudyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: aws-study-cfn-tg
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref StudyVpc
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "200"
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref StudyEc2
+          Port: 8080
+      Tags:
+        - Key: Name
+          Value: aws-study-cfn-tg
+
+  StudyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref StudyAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref StudyTargetGroup
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref StudyVpc
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref StudyEc2
+  PublicIp:
+    Description: EC2 public IP
+    Value: !GetAtt StudyEc2.PublicIp
+  RdsEndpoint:
+    Description: RDS endpoint
+    Value: !GetAtt StudyRds.Endpoint.Address
+  AlbDns:
+    Description: ALB DNS (browser/curl target)
+    Value: !GetAtt StudyAlb.DNSName
