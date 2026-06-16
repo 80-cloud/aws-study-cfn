@@ -11,6 +11,14 @@ Parameters:
     NoEcho: true
     MinLength: 8
     Description: RDS master password (8+ chars)
+  KeyName:
+    Type: String
+    Default: ""
+    Description: EC2 キーペア名（空ならSSHキーなしで作成。SSHが必要な環境でのみ指定）
+
+Conditions:
+  # KeyName が空でないときだけ EC2 に鍵を付ける（指定キーペアが無い環境でも失敗しないように）
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
 
 Resources:
   StudyVpc:
@@ -153,7 +161,7 @@ Resources:
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: t3.micro
-      KeyName: review-park-key
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
       SubnetId: !Ref PublicSubnetA
       SecurityGroupIds:
         - !Ref Ec2SecurityGroup
