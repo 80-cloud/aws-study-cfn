@@ -15,10 +15,16 @@ Parameters:
     Type: String
     Default: ""
     Description: EC2 キーペア名（空ならSSHキーなしで作成。SSHが必要な環境でのみ指定）
+  AlertEmail:
+    Type: String
+    Description: アラーム通知先メールアドレス（SNSメール購読の宛先）
+    AllowedPattern: '^[^@]+@[^@]+\.[^@]+$'
+    ConstraintDescription: 有効なメールアドレス形式で入力してください（例 you@example.com）
 
 Conditions:
   # KeyName が空でないときだけ EC2 に鍵を付ける（指定キーペアが無い環境でも失敗しないように）
   HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
 
 Resources:
   StudyVpc:
@@ -295,6 +301,152 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref StudyTargetGroup
 
+  # ---- 通知（SNS） ----
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---- CPU使用率アラーム ----
+  Ec2CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ec2-cpu-high"
+      AlarmDescription: EC2 CPU使用率が高い
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref StudyEc2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ---- ステータスチェック＋自己修復（通知とRecoverを両方リストで指定） ----
+  Ec2StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ec2-status-system"
+      AlarmDescription: System障害を検知してメール通知＋自動復旧(Recover)
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref StudyEc2
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+        - !Sub "arn:aws:automate:${AWS::Region}:ec2:recover"
+ # ---- WAF（WebACL＋ALB紐付け） ----
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${AWS::StackName}-web-acl"
+      Scope: REGIONAL                # ALB用はREGIONAL（CloudFront用はCLOUDFRONT）
+      DefaultAction:
+        Allow: {}                    # 既定は許可（ルールに当たったものだけブロック）
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-web-acl"
+      Rules:
+        - Name: AWSCommonRules
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet    # AWS提供の定番ルール群
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSCommonRules
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref StudyAlb       # ALBのRefはARNを返す（合格ライン対応）
+      WebACLArn: !GetAtt WebAcl.Arn
+   # ---- WAFログ用 ロググループ（名前は必ず aws-waf-logs- で始める） ----
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "aws-waf-logs-${AWS::StackName}"
+      RetentionInDays: 7
+
+  # ---- WAFがロググループへ書き込むための権限（Logsリソースポリシー） ----
+  WafLogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-waf-logs-policy"
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "${WafLogGroup.Arn}",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" }
+              }
+            }
+          ]
+        }
+
+  # ---- WAFログを CloudWatch Logs へ送る連携 ----
+  WafLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    DependsOn: WafLogResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        # ロググループARNの末尾 ":*" を除去して渡す（WAFは :* 付きを受け付けない）
+        - !Select [0, !Split [":*", !GetAtt WafLogGroup.Arn]]
+
+  # ---- WAFブロック監視アラーム ----
+  WafBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-waf-blocked"
+      AlarmDescription: WAFがブロックしたリクエストが増えたら通知
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub "${AWS::StackName}-web-acl"   # ★WebAclのVisibilityConfig MetricNameと一致
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+
 Outputs:
   VpcId:
     Description: VPC ID
@@ -311,3 +463,12 @@ Outputs:
   AlbDns:
     Description: ALB DNS (browser/curl target)
     Value: !GetAtt StudyAlb.DNSName
+  AlertTopicArn:
+    Description: SNS alert topic ARN
+    Value: !Ref AlertTopic
+  WebAclArn:
+    Description: WAF WebACL ARN
+    Value: !GetAtt WebAcl.Arn
+  WafLogGroupName:
+    Description: WAF log group name (CloudWatch Logs)
+    Value: !Ref WafLogGroup
