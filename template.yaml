@@ -17,7 +17,9 @@ Parameters:
     Description: EC2 キーペア名（空ならSSHキーなしで作成。SSHが必要な環境でのみ指定）
   AlertEmail:
     Type: String
-    Description: アラーム通知先メールアドレス
+    Description: アラーム通知先メールアドレス（SNSメール購読の宛先）
+    AllowedPattern: '^[^@]+@[^@]+\.[^@]+$'
+    ConstraintDescription: 有効なメールアドレス形式で入力してください（例 you@example.com）
 
 Conditions:
   # KeyName が空でないときだけ EC2 に鍵を付ける（指定キーペアが無い環境でも失敗しないように）
@@ -389,9 +391,31 @@ Resources:
       LogGroupName: !Sub "aws-waf-logs-${AWS::StackName}"
       RetentionInDays: 7
 
+  # ---- WAFがロググループへ書き込むための権限（Logsリソースポリシー） ----
+  WafLogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-waf-logs-policy"
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "${WafLogGroup.Arn}",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" }
+              }
+            }
+          ]
+        }
+
   # ---- WAFログを CloudWatch Logs へ送る連携 ----
   WafLoggingConfiguration:
     Type: AWS::WAFv2::LoggingConfiguration
+    DependsOn: WafLogResourcePolicy
     Properties:
       ResourceArn: !GetAtt WebAcl.Arn
       LogDestinationConfigs:
@@ -439,3 +463,12 @@ Outputs:
   AlbDns:
     Description: ALB DNS (browser/curl target)
     Value: !GetAtt StudyAlb.DNSName
+  AlertTopicArn:
+    Description: SNS alert topic ARN
+    Value: !Ref AlertTopic
+  WebAclArn:
+    Description: WAF WebACL ARN
+    Value: !GetAtt WebAcl.Arn
+  WafLogGroupName:
+    Description: WAF log group name (CloudWatch Logs)
+    Value: !Ref WafLogGroup
